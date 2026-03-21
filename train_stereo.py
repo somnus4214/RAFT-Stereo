@@ -9,6 +9,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from core.raft_stereo import RAFTStereo
 
@@ -69,9 +70,51 @@ def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
     return flow_loss, metrics
 
 
+def gradient_x(img):
+    img = F.pad(img, (0, 1, 0, 0), mode="replicate")
+    gx = img[:, :, :, :-1] - img[:, :, :, 1:]
+    return gx
+
+def gradient_y(img):
+    img = F.pad(img, (0, 0, 0, 1), mode="replicate")
+    gy = img[:, :, :-1, :] - img[:, :, 1:, :]
+    return gy
+
+def edge_weight_from_image(image):
+    # image shape [B, 3, H, W]
+    # convert to grayscale
+    gray = 0.299 * image[:, 0:1, :, :] + 0.587 * image[:, 1:2, :, :] + 0.114 * image[:, 2:3, :, :]
+    gx = gradient_x(gray).abs()
+    gy = gradient_y(gray).abs()
+    grad = gx + gy
+    
+    # normalize by the mean of each image in the batch
+    b, c, h, w = grad.shape
+    grad_mean = grad.view(b, c, -1).mean(dim=2).view(b, c, 1, 1).clamp(min=1e-5)
+    normalized_grad = grad / grad_mean
+    
+    weight = 1.0 + 0.5 * normalized_grad
+    return weight
+
+def refined_loss(disp_refined, flow_gt, valid):
+    mag = torch.sum(flow_gt**2, dim=1).sqrt()
+    valid_mask = ((valid >= 0.5) & (mag < 700)).unsqueeze(1)
+    
+    loss = (disp_refined - flow_gt).abs()
+    return loss[valid_mask.bool()].mean()
+
+def edge_aware_loss(disp_refined, flow_gt, valid, image1):
+    mag = torch.sum(flow_gt**2, dim=1).sqrt()
+    valid_mask = ((valid >= 0.5) & (mag < 700)).unsqueeze(1)
+    
+    weight = edge_weight_from_image(image1)
+    loss = (disp_refined - flow_gt).abs() * weight
+    return loss[valid_mask.bool()].mean()
+
+
 def fetch_optimizer(args, model):
     """ Create the optimizer and learning rate scheduler """
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
 
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
             pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
@@ -134,17 +177,27 @@ def train(args):
     model = nn.DataParallel(RAFTStereo(args))
     print("Parameter Count: %d" % count_parameters(model))
 
-    train_loader = datasets.fetch_dataloader(args)
-    optimizer, scheduler = fetch_optimizer(args, model)
-    total_steps = 0
-    logger = Logger(model, scheduler)
-
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
         model.load_state_dict(checkpoint, strict=True)
         logging.info(f"Done loading checkpoint")
+
+    if args.refine_only:
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+
+        for name, param in model.module.refinement_head.named_parameters():
+            param.requires_grad = True
+
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Trainable Parameter Count after freezing backbone: {trainable_params}")
+
+    train_loader = datasets.fetch_dataloader(args)
+    optimizer, scheduler = fetch_optimizer(args, model)
+    total_steps = 0
+    logger = Logger(model, scheduler)
 
     model.cuda()
     model.train()
@@ -158,16 +211,32 @@ def train(args):
     global_batch_num = 0
     while should_keep_training:
 
-        for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
-            optimizer.zero_grad()
-            image1, image2, flow, valid = [x.cuda() for x in data_blob]
+            for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
+                optimizer.zero_grad()
+                image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
-            assert model.training
-            flow_predictions = model(image1, image2, iters=args.train_iters)
-            assert model.training
+                assert model.training
+                if args.use_refinement:
+                    flow_predictions, disp_refined = model(image1, image2, iters=args.train_iters)
+                else:
+                    flow_predictions = model(image1, image2, iters=args.train_iters)
+                assert model.training
 
-            loss, metrics = sequence_loss(flow_predictions, flow, valid)
-            logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+                loss_seq, metrics = sequence_loss(flow_predictions, flow, valid)
+                loss = loss_seq
+                metrics["loss_seq"] = loss_seq.item()
+
+                if args.use_refinement:
+                    loss_ref = refined_loss(disp_refined, flow, valid)
+                    loss += args.lambda_ref * loss_ref
+                    metrics["loss_ref"] = loss_ref.item()
+                    
+                    if args.use_edge_loss:
+                        loss_edge = edge_aware_loss(disp_refined, flow, valid, image1)
+                        loss += args.lambda_edge * loss_edge
+                        metrics["loss_edge"] = loss_edge.item()
+
+                logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1
             scaler.scale(loss).backward()
@@ -246,6 +315,13 @@ if __name__ == '__main__':
     parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
     parser.add_argument('--spatial_scale', type=float, nargs='+', default=[0, 0], help='re-scale the images randomly')
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
+    
+    # Refinement and ablation
+    parser.add_argument('--use_refinement', action='store_true', help="是否启用 refinement head")
+    parser.add_argument('--use_edge_loss', action='store_true', help="是否启用 edge-aware loss")
+    parser.add_argument('--refine_only', action='store_true', help="是否冻结主干，只训练 refinement head")
+    parser.add_argument('--lambda_ref', type=float, default=1.0)
+    parser.add_argument('--lambda_edge', type=float, default=0.2)
     args = parser.parse_args()
 
     torch.manual_seed(1234)

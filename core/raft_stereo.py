@@ -5,6 +5,7 @@ from core.update import BasicMultiUpdateBlock
 from core.extractor import BasicEncoder, MultiBasicEncoder, ResidualBlock
 from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D, AlternateCorrBlock
 from core.utils.utils import coords_grid, upflow8
+from core.refinement import RefinementHead
 
 
 try:
@@ -38,6 +39,8 @@ class RAFTStereo(nn.Module):
         else:
             self.fnet = BasicEncoder(output_dim=256, norm_fn='instance', downsample=args.n_downsample)
 
+        self.refinement_head = RefinementHead(in_channels=4, hidden_dim=32)
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -69,6 +72,8 @@ class RAFTStereo(nn.Module):
 
     def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
         """ Estimate optical flow between pair of frames """
+
+        image1_raw = image1
 
         image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
         image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
@@ -135,7 +140,16 @@ class RAFTStereo(nn.Module):
 
             flow_predictions.append(flow_up)
 
-        if test_mode:
-            return coords1 - coords0, flow_up
+        if hasattr(self.args, 'use_refinement') and self.args.use_refinement:
+            disp0 = flow_predictions[-1]
+            disp_refined = self.refinement_head(image1_raw / 255.0, disp0)
+        else:
+            disp_refined = flow_predictions[-1]
 
+        if test_mode:
+            return coords1 - coords0, disp_refined
+
+        if hasattr(self.args, 'use_refinement') and self.args.use_refinement:
+            return flow_predictions, disp_refined
+            
         return flow_predictions
