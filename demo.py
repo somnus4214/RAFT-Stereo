@@ -22,7 +22,9 @@ def load_image(imfile):
 
 def demo(args):
     model = torch.nn.DataParallel(RAFTStereo(args), device_ids=[0])
-    model.load_state_dict(torch.load(args.restore_ckpt))
+    
+    msg = model.load_state_dict(torch.load(args.restore_ckpt), strict=False)
+    print(f"Loaded checkpoint: {msg}")
 
     model = model.module
     model.to(DEVICE)
@@ -72,7 +74,8 @@ if __name__ == '__main__':
     parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'], help="normalization of context encoder")
     parser.add_argument('--slow_fast_gru', action='store_true', help="iterate the low-res GRUs more frequently")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
-    
+    parser.add_argument('--use_refinement', action='store_true', help="是否启用 refinement head")
+
     args = parser.parse_args()
 
     demo(args)

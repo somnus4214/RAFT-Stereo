@@ -1,2 +1,5 @@
 models
 data
+runs
+checkpoints
+__pycache__

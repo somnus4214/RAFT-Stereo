@@ -181,7 +181,8 @@ def train(args):
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        msg=model.load_state_dict(checkpoint, strict=False)
+        print(msg)
         logging.info(f"Done loading checkpoint")
 
     if args.refine_only:
@@ -194,7 +195,25 @@ def train(args):
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Trainable Parameter Count after freezing backbone: {trainable_params}")
 
-    train_loader = datasets.fetch_dataloader(args)
+    if args.train_dataset == 'middlebury':
+        aug_params = {'crop_size': args.image_size, 'min_scale': args.spatial_scale[0], 'max_scale': args.spatial_scale[1], 'do_flip': False, 'yjitter': not args.noyjitter}
+        if hasattr(args, "saturation_range") and args.saturation_range is not None:
+            aug_params["saturation_range"] = args.saturation_range
+        if hasattr(args, "img_gamma") and args.img_gamma is not None:
+            aug_params["gamma"] = args.img_gamma
+        if hasattr(args, "do_flip") and args.do_flip is not None:
+            aug_params["do_flip"] = args.do_flip
+            
+        train_dataset = datasets.Middlebury(aug_params, split='2014')
+        if len(train_dataset) == 0:
+            raise RuntimeError(f"No Middlebury samples found in /root/autodl-tmp/middlebury/2014/. Check your dataset path.")
+        
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, 
+            pin_memory=True, shuffle=True, num_workers=2, drop_last=True)
+            
+        logging.info('Training with %d image pairs from Middlebury' % len(train_dataset))
+    else:
+        train_loader = datasets.fetch_dataloader(args)
     optimizer, scheduler = fetch_optimizer(args, model)
     total_steps = 0
     logger = Logger(model, scheduler)
@@ -211,32 +230,32 @@ def train(args):
     global_batch_num = 0
     while should_keep_training:
 
-            for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
-                optimizer.zero_grad()
-                image1, image2, flow, valid = [x.cuda() for x in data_blob]
+        for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
+            optimizer.zero_grad()
+            image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
-                assert model.training
-                if args.use_refinement:
-                    flow_predictions, disp_refined = model(image1, image2, iters=args.train_iters)
-                else:
-                    flow_predictions = model(image1, image2, iters=args.train_iters)
-                assert model.training
+            assert model.training
+            if args.use_refinement:
+                flow_predictions, disp_refined = model(image1, image2, iters=args.train_iters)
+            else:
+                flow_predictions = model(image1, image2, iters=args.train_iters)
+            assert model.training
 
-                loss_seq, metrics = sequence_loss(flow_predictions, flow, valid)
-                loss = loss_seq
-                metrics["loss_seq"] = loss_seq.item()
+            loss_seq, metrics = sequence_loss(flow_predictions, flow, valid)
+            loss = loss_seq
+            metrics["loss_seq"] = loss_seq.item()
 
-                if args.use_refinement:
-                    loss_ref = refined_loss(disp_refined, flow, valid)
-                    loss += args.lambda_ref * loss_ref
-                    metrics["loss_ref"] = loss_ref.item()
-                    
-                    if args.use_edge_loss:
-                        loss_edge = edge_aware_loss(disp_refined, flow, valid, image1)
-                        loss += args.lambda_edge * loss_edge
-                        metrics["loss_edge"] = loss_edge.item()
+            if args.use_refinement:
+                loss_ref = refined_loss(disp_refined, flow, valid)
+                loss += args.lambda_ref * loss_ref
+                metrics["loss_ref"] = loss_ref.item()
+                
+                if args.use_edge_loss:
+                    loss_edge = edge_aware_loss(disp_refined, flow, valid, image1)
+                    loss += args.lambda_edge * loss_edge
+                    metrics["loss_edge"] = loss_edge.item()
 
-                logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+            logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1
             scaler.scale(loss).backward()
@@ -289,6 +308,7 @@ if __name__ == '__main__':
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
+    parser.add_argument('--train_dataset', type=str, default='sceneflow', help="training dataset choice (sceneflow or middlebury).")
     parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
     parser.add_argument('--num_steps', type=int, default=100000, help="length of training schedule.")
     parser.add_argument('--image_size', type=int, nargs='+', default=[320, 720], help="size of the random image crops used during training.")

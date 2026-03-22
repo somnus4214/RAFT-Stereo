@@ -258,13 +258,21 @@ class KITTI(StereoDataset):
 
 
 class Middlebury(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/Middlebury', split='F'):
+    def __init__(self, aug_params=None, root='/root/autodl-tmp/middlebury', split='F'):
         super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury)
         assert os.path.exists(root)
         assert split in ["F", "H", "Q", "2014"]
         if split == "2014": # datasets/Middlebury/2014/Pipes-perfect/im0.png
             scenes = list((Path(root) / "2014").glob("*"))
             for scene in scenes:
+                if not scene.is_dir(): continue
+                # Handling cases like 'Umbrella-imperfect(1)/Umbrella-imperfect' where it is nested
+                if not (scene / "disp0.pfm").exists():
+                    sub_dirs = [d for d in scene.iterdir() if d.is_dir()]
+                    if len(sub_dirs) > 0:
+                        scene = sub_dirs[0]
+                if not (scene / "disp0.pfm").exists(): continue
+                        
                 for s in ["E","L",""]:
                     self.image_list += [ [str(scene / "im0.png"), str(scene / f"im1{s}.png")] ]
                     self.disparity_list += [ str(scene / "disp0.pfm") ]

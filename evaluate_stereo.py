@@ -192,7 +192,7 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default=None)
-    parser.add_argument('--dataset', help="dataset for evaluation", required=True, choices=["eth3d", "kitti", "things"] + [f"middlebury_{s}" for s in 'FHQ'])
+    parser.add_argument('--dataset', help="dataset for evaluation", required=True, choices=["eth3d", "kitti", "things"] + [f"middlebury_{s}" for s in ['F','H','Q','2014']])
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
 
@@ -206,6 +206,7 @@ if __name__ == '__main__':
     parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'], help="normalization of context encoder")
     parser.add_argument('--slow_fast_gru', action='store_true', help="iterate the low-res GRUs more frequently")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
+    parser.add_argument('--use_refinement', action='store_true', help="是否启用 refinement head")
     args = parser.parse_args()
 
     model = torch.nn.DataParallel(RAFTStereo(args), device_ids=[0])
@@ -217,8 +218,8 @@ if __name__ == '__main__':
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
-        logging.info(f"Done loading checkpoint")
+        msg = model.load_state_dict(checkpoint, strict=False)
+        logging.info(f"Done loading checkpoint, msg: {msg}")
 
     model.cuda()
     model.eval()
@@ -236,8 +237,8 @@ if __name__ == '__main__':
     elif args.dataset == 'kitti':
         validate_kitti(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
 
-    elif args.dataset in [f"middlebury_{s}" for s in 'FHQ']:
-        validate_middlebury(model, iters=args.valid_iters, split=args.dataset[-1], mixed_prec=use_mixed_precision)
+    elif args.dataset in [f"middlebury_{s}" for s in ['F','H','Q','2014']]:
+        validate_middlebury(model, iters=args.valid_iters, split=args.dataset.split('_')[-1], mixed_prec=use_mixed_precision)
 
     elif args.dataset == 'things':
         validate_things(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
