@@ -114,14 +114,61 @@ def edge_aware_loss(disp_refined, flow_gt, valid, image1):
 
 def fetch_optimizer(args, model):
     """ Create the optimizer and learning rate scheduler """
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+    use_refinement = getattr(args, 'use_refinement', False)
+    
+    if use_refinement and getattr(args, 'partial_unfreeze', False):
+        refine_params = []
+        update_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'update_block' in name:
+                update_params.append(param)
+            elif 'refinement_head' in name:
+                refine_params.append(param)
+        
+        lr_refine = getattr(args, 'lr_refine', args.lr)
+        lr_update_block = getattr(args, 'lr_update_block', args.lr)
+                
+        logging.info("Training mode: partial_unfreeze (refinement_head + update_block are trainable)")
+        logging.info(f"Optimizer Group A (refinement_head): {sum(p.numel() for p in refine_params)} parameters, lr: {lr_refine}")
+        logging.info(f"Optimizer Group B (update_block): {sum(p.numel() for p in update_params)} parameters, lr: {lr_update_block}")
 
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
-            pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
+        optimizer = optim.AdamW([
+            {'params': refine_params, 'lr': lr_refine},
+            {'params': update_params, 'lr': lr_update_block}
+        ], weight_decay=args.wdecay, eps=1e-8)
+        max_lr = [lr_refine, lr_update_block]
+        
+    elif use_refinement and getattr(args, 'refine_only', False):
+        refine_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'refinement_head' in name:
+                refine_params.append(param)
+                
+        lr_refine = getattr(args, 'lr_refine', args.lr)
+        
+        logging.info("Training mode: refine_only (only refinement_head is trainable)")
+        logging.info(f"Optimizer Group (refinement_head): {sum(p.numel() for p in refine_params)} parameters, lr: {lr_refine}")
 
+        optimizer = optim.AdamW([
+            {'params': refine_params, 'lr': lr_refine}
+        ], weight_decay=args.wdecay, eps=1e-8)
+        max_lr = [lr_refine]
+        
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
+        logging.info(f"Training mode: standard (all un-frozen parameters trainable)")
+        logging.info(f"Optimizer Group (all un-frozen): {sum(p.numel() for p in params)} parameters, lr: {args.lr}")
+        optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+        max_lr = args.lr
+
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr, args.num_steps+100,
+        pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
+    
     return optimizer, scheduler
-
-
 class Logger:
 
     SUM_FREQ = 100
@@ -174,6 +221,14 @@ class Logger:
 
 def train(args):
 
+    # Argument validation
+    if getattr(args, 'refine_only', False) and getattr(args, 'partial_unfreeze', False):
+        raise ValueError("Cannot set both --refine_only and --partial_unfreeze at the same time.")
+    if getattr(args, 'partial_unfreeze', False) and not getattr(args, 'use_refinement', False):
+        raise ValueError("Cannot use --partial_unfreeze without --use_refinement.")
+    if getattr(args, 'refine_only', False) and not getattr(args, 'use_refinement', False):
+        raise ValueError("Cannot use --refine_only without --use_refinement.")
+
     model = nn.DataParallel(RAFTStereo(args))
     print("Parameter Count: %d" % count_parameters(model))
 
@@ -185,16 +240,38 @@ def train(args):
         print(msg)
         logging.info(f"Done loading checkpoint")
 
-    if args.refine_only:
+    if not args.use_refinement:
+        # Case 1: Train original RAFT-Stereo as usual
+        for name, param in model.named_parameters():
+            param.requires_grad = True
+    elif args.use_refinement and args.refine_only:
+        # Case 2: Freeze RAFT-Stereo, only train refinement head
         for name, param in model.named_parameters():
             param.requires_grad = False
+        if hasattr(model, 'module') and hasattr(model.module, 'refinement_head'):
+            for name, param in model.module.refinement_head.named_parameters():
+                param.requires_grad = True
+    elif args.use_refinement and args.partial_unfreeze:
+        # Case 3: Freeze RAFT-Stereo, train refinement head and update_block
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+        if hasattr(model, 'module') and hasattr(model.module, 'refinement_head'):
+            for name, param in model.module.refinement_head.named_parameters():
+                param.requires_grad = True
+        if hasattr(model, 'module') and hasattr(model.module, 'update_block'):
+            for name, param in model.module.update_block.named_parameters():
+                param.requires_grad = True
 
-        for name, param in model.module.refinement_head.named_parameters():
-            param.requires_grad = True
-
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Trainable Parameter Count after freezing backbone: {trainable_params}")
-
+    # Print trainable parameter names and total trainable parameter count for debugging
+    logging.info("--- Trainable Parameters ---")
+    trainable_params = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logging.info(f"Trainable: {name}")
+            trainable_params += param.numel()
+    logging.info(f"Total Trainable Parameter Count: {trainable_params}")
+    logging.info("----------------------------")
+    
     if args.train_dataset == 'middlebury':
         aug_params = {'crop_size': args.image_size, 'min_scale': args.spatial_scale[0], 'max_scale': args.spatial_scale[1], 'do_flip': False, 'yjitter': not args.noyjitter}
         if hasattr(args, "saturation_range") and args.saturation_range is not None:
@@ -340,6 +417,9 @@ if __name__ == '__main__':
     parser.add_argument('--use_refinement', action='store_true', help="是否启用 refinement head")
     parser.add_argument('--use_edge_loss', action='store_true', help="是否启用 edge-aware loss")
     parser.add_argument('--refine_only', action='store_true', help="是否冻结主干，只训练 refinement head")
+    parser.add_argument('--partial_unfreeze', action='store_true', help="Train refinement_head and update_block together, while keeping the rest frozen.")
+    parser.add_argument('--lr_update_block', type=float, default=1e-5, help="Learning rate for update_block during partial unfreeze.")
+    parser.add_argument('--lr_refine', type=float, default=1e-4, help="Learning rate for refinement_head.")
     parser.add_argument('--lambda_ref', type=float, default=1.0)
     parser.add_argument('--lambda_edge', type=float, default=0.2)
     args = parser.parse_args()
