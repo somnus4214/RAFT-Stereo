@@ -1,20 +1,21 @@
-from __future__ import print_function, division
+from __future__ import division, print_function
 
 import argparse
 import logging
-import numpy as np
 from pathlib import Path
-from tqdm import tqdm
 
-from torch.utils.tensorboard import SummaryWriter
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from core.raft_stereo import RAFTStereo
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
-from evaluate_stereo import *
 import core.stereo_datasets as datasets
+from core.raft_stereo import RAFTStereo
+from core.raft_stereo_lite import LiteRAFTStereo
+from evaluate_stereo import *
 
 try:
     from torch.cuda.amp import GradScaler
@@ -23,18 +24,22 @@ except:
     class GradScaler:
         def __init__(self):
             pass
+
         def scale(self, loss):
             return loss
+
         def unscale_(self, optimizer):
             pass
+
         def step(self, optimizer):
             optimizer.step()
+
         def update(self):
             pass
 
 
 def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
-    """ Loss function defined over sequence of flow predictions """
+    """Loss function defined over sequence of flow predictions"""
 
     n_predictions = len(flow_preds)
     assert n_predictions >= 1
@@ -49,22 +54,30 @@ def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
     assert not torch.isinf(flow_gt[valid.bool()]).any()
 
     for i in range(n_predictions):
-        assert not torch.isnan(flow_preds[i]).any() and not torch.isinf(flow_preds[i]).any()
+        assert (
+            not torch.isnan(flow_preds[i]).any()
+            and not torch.isinf(flow_preds[i]).any()
+        )
         # We adjust the loss_gamma so it is consistent for any number of RAFT-Stereo iterations
-        adjusted_loss_gamma = loss_gamma**(15/(n_predictions - 1))
-        i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
+        adjusted_loss_gamma = loss_gamma ** (15 / (n_predictions - 1))
+        i_weight = adjusted_loss_gamma ** (n_predictions - i - 1)
         i_loss = (flow_preds[i] - flow_gt).abs()
-        assert i_loss.shape == valid.shape, [i_loss.shape, valid.shape, flow_gt.shape, flow_preds[i].shape]
+        assert i_loss.shape == valid.shape, [
+            i_loss.shape,
+            valid.shape,
+            flow_gt.shape,
+            flow_preds[i].shape,
+        ]
         flow_loss += i_weight * i_loss[valid.bool()].mean()
 
-    epe = torch.sum((flow_preds[-1] - flow_gt)**2, dim=1).sqrt()
+    epe = torch.sum((flow_preds[-1] - flow_gt) ** 2, dim=1).sqrt()
     epe = epe.view(-1)[valid.view(-1)]
 
     metrics = {
-        'epe': epe.mean().item(),
-        '1px': (epe < 1).float().mean().item(),
-        '3px': (epe < 3).float().mean().item(),
-        '5px': (epe < 5).float().mean().item(),
+        "epe": epe.mean().item(),
+        "1px": (epe < 1).float().mean().item(),
+        "3px": (epe < 3).float().mean().item(),
+        "5px": (epe < 5).float().mean().item(),
     }
 
     return flow_loss, metrics
@@ -75,102 +88,133 @@ def gradient_x(img):
     gx = img[:, :, :, :-1] - img[:, :, :, 1:]
     return gx
 
+
 def gradient_y(img):
     img = F.pad(img, (0, 0, 0, 1), mode="replicate")
     gy = img[:, :, :-1, :] - img[:, :, 1:, :]
     return gy
 
+
 def edge_weight_from_image(image):
     # image shape [B, 3, H, W]
     # convert to grayscale
-    gray = 0.299 * image[:, 0:1, :, :] + 0.587 * image[:, 1:2, :, :] + 0.114 * image[:, 2:3, :, :]
+    gray = (
+        0.299 * image[:, 0:1, :, :]
+        + 0.587 * image[:, 1:2, :, :]
+        + 0.114 * image[:, 2:3, :, :]
+    )
     gx = gradient_x(gray).abs()
     gy = gradient_y(gray).abs()
     grad = gx + gy
-    
+
     # normalize by the mean of each image in the batch
     b, c, h, w = grad.shape
     grad_mean = grad.view(b, c, -1).mean(dim=2).view(b, c, 1, 1).clamp(min=1e-5)
     normalized_grad = grad / grad_mean
-    
+
     weight = 1.0 + 0.5 * normalized_grad
     return weight
+
 
 def refined_loss(disp_refined, flow_gt, valid):
     mag = torch.sum(flow_gt**2, dim=1).sqrt()
     valid_mask = ((valid >= 0.5) & (mag < 700)).unsqueeze(1)
-    
+
     loss = (disp_refined - flow_gt).abs()
     return loss[valid_mask.bool()].mean()
+
 
 def edge_aware_loss(disp_refined, flow_gt, valid, image1):
     mag = torch.sum(flow_gt**2, dim=1).sqrt()
     valid_mask = ((valid >= 0.5) & (mag < 700)).unsqueeze(1)
-    
+
     weight = edge_weight_from_image(image1)
     loss = (disp_refined - flow_gt).abs() * weight
     return loss[valid_mask.bool()].mean()
 
 
 def fetch_optimizer(args, model):
-    """ Create the optimizer and learning rate scheduler """
-    use_refinement = getattr(args, 'use_refinement', False)
-    
-    if use_refinement and getattr(args, 'partial_unfreeze', False):
+    """Create the optimizer and learning rate scheduler"""
+    use_refinement = getattr(args, "use_refinement", False)
+
+    if use_refinement and getattr(args, "partial_unfreeze", False):
         refine_params = []
         update_params = []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'update_block' in name:
+            if "update_block" in name:
                 update_params.append(param)
-            elif 'refinement_head' in name:
+            elif "refinement_head" in name:
                 refine_params.append(param)
-        
-        lr_refine = getattr(args, 'lr_refine', args.lr)
-        lr_update_block = getattr(args, 'lr_update_block', args.lr)
-                
-        logging.info("Training mode: partial_unfreeze (refinement_head + update_block are trainable)")
-        logging.info(f"Optimizer Group A (refinement_head): {sum(p.numel() for p in refine_params)} parameters, lr: {lr_refine}")
-        logging.info(f"Optimizer Group B (update_block): {sum(p.numel() for p in update_params)} parameters, lr: {lr_update_block}")
 
-        optimizer = optim.AdamW([
-            {'params': refine_params, 'lr': lr_refine},
-            {'params': update_params, 'lr': lr_update_block}
-        ], weight_decay=args.wdecay, eps=1e-8)
+        lr_refine = getattr(args, "lr_refine", args.lr)
+        lr_update_block = getattr(args, "lr_update_block", args.lr)
+
+        logging.info(
+            "Training mode: partial_unfreeze (refinement_head + update_block are trainable)"
+        )
+        logging.info(
+            f"Optimizer Group A (refinement_head): {sum(p.numel() for p in refine_params)} parameters, lr: {lr_refine}"
+        )
+        logging.info(
+            f"Optimizer Group B (update_block): {sum(p.numel() for p in update_params)} parameters, lr: {lr_update_block}"
+        )
+
+        optimizer = optim.AdamW(
+            [
+                {"params": refine_params, "lr": lr_refine},
+                {"params": update_params, "lr": lr_update_block},
+            ],
+            weight_decay=args.wdecay,
+            eps=1e-8,
+        )
         max_lr = [lr_refine, lr_update_block]
-        
-    elif use_refinement and getattr(args, 'refine_only', False):
+
+    elif use_refinement and getattr(args, "refine_only", False):
         refine_params = []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if 'refinement_head' in name:
+            if "refinement_head" in name:
                 refine_params.append(param)
-                
-        lr_refine = getattr(args, 'lr_refine', args.lr)
-        
-        logging.info("Training mode: refine_only (only refinement_head is trainable)")
-        logging.info(f"Optimizer Group (refinement_head): {sum(p.numel() for p in refine_params)} parameters, lr: {lr_refine}")
 
-        optimizer = optim.AdamW([
-            {'params': refine_params, 'lr': lr_refine}
-        ], weight_decay=args.wdecay, eps=1e-8)
+        lr_refine = getattr(args, "lr_refine", args.lr)
+
+        logging.info("Training mode: refine_only (only refinement_head is trainable)")
+        logging.info(
+            f"Optimizer Group (refinement_head): {sum(p.numel() for p in refine_params)} parameters, lr: {lr_refine}"
+        )
+
+        optimizer = optim.AdamW(
+            [{"params": refine_params, "lr": lr_refine}],
+            weight_decay=args.wdecay,
+            eps=1e-8,
+        )
         max_lr = [lr_refine]
-        
+
     else:
         params = [p for p in model.parameters() if p.requires_grad]
         logging.info(f"Training mode: standard (all un-frozen parameters trainable)")
-        logging.info(f"Optimizer Group (all un-frozen): {sum(p.numel() for p in params)} parameters, lr: {args.lr}")
+        logging.info(
+            f"Optimizer Group (all un-frozen): {sum(p.numel() for p in params)} parameters, lr: {args.lr}"
+        )
         optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
         max_lr = args.lr
 
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr, args.num_steps+100,
-        pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
-    
-    return optimizer, scheduler
-class Logger:
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr,
+        args.num_steps + 100,
+        pct_start=0.01,
+        cycle_momentum=False,
+        anneal_strategy="linear",
+    )
 
+    return optimizer, scheduler
+
+
+class Logger:
     SUM_FREQ = 100
 
     def __init__(self, model, scheduler):
@@ -178,21 +222,30 @@ class Logger:
         self.scheduler = scheduler
         self.total_steps = 0
         self.running_loss = {}
-        self.writer = SummaryWriter(log_dir='runs')
+        self.writer = SummaryWriter(log_dir="runs")
 
     def _print_training_status(self):
-        metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in sorted(self.running_loss.keys())]
-        training_str = "[{:6d}, {:10.7f}] ".format(self.total_steps+1, self.scheduler.get_last_lr()[0])
-        metrics_str = ("{:10.4f}, "*len(metrics_data)).format(*metrics_data)
-        
+        metrics_data = [
+            self.running_loss[k] / Logger.SUM_FREQ
+            for k in sorted(self.running_loss.keys())
+        ]
+        training_str = "[{:6d}, {:10.7f}] ".format(
+            self.total_steps + 1, self.scheduler.get_last_lr()[0]
+        )
+        metrics_str = ("{:10.4f}, " * len(metrics_data)).format(*metrics_data)
+
         # print the training status
-        logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
+        logging.info(
+            f"Training Metrics ({self.total_steps}): {training_str + metrics_str}"
+        )
 
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir='runs')
+            self.writer = SummaryWriter(log_dir="runs")
 
         for k in self.running_loss:
-            self.writer.add_scalar(k, self.running_loss[k]/Logger.SUM_FREQ, self.total_steps)
+            self.writer.add_scalar(
+                k, self.running_loss[k] / Logger.SUM_FREQ, self.total_steps
+            )
             self.running_loss[k] = 0.0
 
     def push(self, metrics):
@@ -204,13 +257,13 @@ class Logger:
 
             self.running_loss[key] += metrics[key]
 
-        if self.total_steps % Logger.SUM_FREQ == Logger.SUM_FREQ-1:
+        if self.total_steps % Logger.SUM_FREQ == Logger.SUM_FREQ - 1:
             self._print_training_status()
             self.running_loss = {}
 
     def write_dict(self, results):
         if self.writer is None:
-            self.writer = SummaryWriter(log_dir='runs')
+            self.writer = SummaryWriter(log_dir="runs")
 
         for key in results:
             self.writer.add_scalar(key, results[key], self.total_steps)
@@ -220,23 +273,35 @@ class Logger:
 
 
 def train(args):
-
     # Argument validation
-    if getattr(args, 'refine_only', False) and getattr(args, 'partial_unfreeze', False):
-        raise ValueError("Cannot set both --refine_only and --partial_unfreeze at the same time.")
-    if getattr(args, 'partial_unfreeze', False) and not getattr(args, 'use_refinement', False):
+    if getattr(args, "refine_only", False) and getattr(args, "partial_unfreeze", False):
+        raise ValueError(
+            "Cannot set both --refine_only and --partial_unfreeze at the same time."
+        )
+    if getattr(args, "partial_unfreeze", False) and not getattr(
+        args, "use_refinement", False
+    ):
         raise ValueError("Cannot use --partial_unfreeze without --use_refinement.")
-    if getattr(args, 'refine_only', False) and not getattr(args, 'use_refinement', False):
+    if getattr(args, "refine_only", False) and not getattr(
+        args, "use_refinement", False
+    ):
         raise ValueError("Cannot use --refine_only without --use_refinement.")
 
-    model = nn.DataParallel(RAFTStereo(args))
+    if getattr(args, "model_type", "base") == "lite":
+        model = LiteRAFTStereo(args)
+        print(">>> Using LiteRAFT-Stereo (Lightweight) <<<")
+    else:
+        model = RAFTStereo(args)
+        print(">>> Using Default RAFT-Stereo (Base) <<<")
+
+    model = nn.DataParallel(model)
     print("Parameter Count: %d" % count_parameters(model))
 
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        msg=model.load_state_dict(checkpoint, strict=False)
+        msg = model.load_state_dict(checkpoint, strict=False)
         print(msg)
         logging.info(f"Done loading checkpoint")
 
@@ -248,17 +313,17 @@ def train(args):
         # Case 2: Freeze RAFT-Stereo, only train refinement head
         for name, param in model.named_parameters():
             param.requires_grad = False
-        if hasattr(model, 'module') and hasattr(model.module, 'refinement_head'):
+        if hasattr(model, "module") and hasattr(model.module, "refinement_head"):
             for name, param in model.module.refinement_head.named_parameters():
                 param.requires_grad = True
     elif args.use_refinement and args.partial_unfreeze:
         # Case 3: Freeze RAFT-Stereo, train refinement head and update_block
         for name, param in model.named_parameters():
             param.requires_grad = False
-        if hasattr(model, 'module') and hasattr(model.module, 'refinement_head'):
+        if hasattr(model, "module") and hasattr(model.module, "refinement_head"):
             for name, param in model.module.refinement_head.named_parameters():
                 param.requires_grad = True
-        if hasattr(model, 'module') and hasattr(model.module, 'update_block'):
+        if hasattr(model, "module") and hasattr(model.module, "update_block"):
             for name, param in model.module.update_block.named_parameters():
                 param.requires_grad = True
 
@@ -271,24 +336,40 @@ def train(args):
             trainable_params += param.numel()
     logging.info(f"Total Trainable Parameter Count: {trainable_params}")
     logging.info("----------------------------")
-    
-    if args.train_dataset == 'middlebury':
-        aug_params = {'crop_size': args.image_size, 'min_scale': args.spatial_scale[0], 'max_scale': args.spatial_scale[1], 'do_flip': False, 'yjitter': not args.noyjitter}
+
+    if args.train_dataset == "middlebury":
+        aug_params = {
+            "crop_size": args.image_size,
+            "min_scale": args.spatial_scale[0],
+            "max_scale": args.spatial_scale[1],
+            "do_flip": False,
+            "yjitter": not args.noyjitter,
+        }
         if hasattr(args, "saturation_range") and args.saturation_range is not None:
             aug_params["saturation_range"] = args.saturation_range
         if hasattr(args, "img_gamma") and args.img_gamma is not None:
             aug_params["gamma"] = args.img_gamma
         if hasattr(args, "do_flip") and args.do_flip is not None:
             aug_params["do_flip"] = args.do_flip
-            
-        train_dataset = datasets.Middlebury(aug_params, split='2014')
+
+        train_dataset = datasets.Middlebury(aug_params, split="2014")
         if len(train_dataset) == 0:
-            raise RuntimeError(f"No Middlebury samples found in /root/autodl-tmp/middlebury/2014/. Check your dataset path.")
-        
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, 
-            pin_memory=True, shuffle=True, num_workers=2, drop_last=True)
-            
-        logging.info('Training with %d image pairs from Middlebury' % len(train_dataset))
+            raise RuntimeError(
+                f"No Middlebury samples found in /root/autodl-tmp/middlebury/2014/. Check your dataset path."
+            )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            shuffle=True,
+            num_workers=2,
+            drop_last=True,
+        )
+
+        logging.info(
+            "Training with %d image pairs from Middlebury" % len(train_dataset)
+        )
     else:
         train_loader = datasets.fetch_dataloader(args)
     optimizer, scheduler = fetch_optimizer(args, model)
@@ -297,7 +378,7 @@ def train(args):
 
     model.cuda()
     model.train()
-    model.module.freeze_bn() # We keep BatchNorm frozen
+    model.module.freeze_bn()  # We keep BatchNorm frozen
 
     validation_frequency = 10000
 
@@ -306,14 +387,15 @@ def train(args):
     should_keep_training = True
     global_batch_num = 0
     while should_keep_training:
-
         for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
             optimizer.zero_grad()
             image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
             assert model.training
             if args.use_refinement:
-                flow_predictions, disp_refined = model(image1, image2, iters=args.train_iters)
+                flow_predictions, disp_refined = model(
+                    image1, image2, iters=args.train_iters
+                )
             else:
                 flow_predictions = model(image1, image2, iters=args.train_iters)
             assert model.training
@@ -326,14 +408,16 @@ def train(args):
                 loss_ref = refined_loss(disp_refined, flow, valid)
                 loss += args.lambda_ref * loss_ref
                 metrics["loss_ref"] = loss_ref.item()
-                
+
                 if args.use_edge_loss:
                     loss_edge = edge_aware_loss(disp_refined, flow, valid, image1)
                     loss += args.lambda_edge * loss_edge
                     metrics["loss_edge"] = loss_edge.item()
 
             logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
-            logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+            logger.writer.add_scalar(
+                f"learning_rate", optimizer.param_groups[0]["lr"], global_batch_num
+            )
             global_batch_num += 1
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -346,7 +430,7 @@ def train(args):
             logger.push(metrics)
 
             if total_steps % validation_frequency == validation_frequency - 1:
-                save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                save_path = Path("checkpoints/%d_%s.pth" % (total_steps + 1, args.name))
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
@@ -364,71 +448,208 @@ def train(args):
                 break
 
         if len(train_loader) >= 10000:
-            save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
+            save_path = Path(
+                "checkpoints/%d_epoch_%s.pth.gz" % (total_steps + 1, args.name)
+            )
             logging.info(f"Saving file {save_path}")
             torch.save(model.state_dict(), save_path)
 
     print("FINISHED TRAINING")
     logger.close()
-    PATH = 'checkpoints/%s.pth' % args.name
+    PATH = "checkpoints/%s.pth" % args.name
     torch.save(model.state_dict(), PATH)
 
     return PATH
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default='raft-stereo', help="name your experiment")
-    parser.add_argument('--restore_ckpt', help="restore checkpoint")
-    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
+    parser.add_argument("--name", default="raft-stereo", help="name your experiment")
+    parser.add_argument(
+        "--model_type",
+        default="base",
+        choices=["base", "lite"],
+        help="使用原版还是轻量化版本",
+    )
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=96,
+        help="Lite 模型的 GRU 隐藏维度 (仅 model_type=lite 生效)",
+    )
+    parser.add_argument(
+        "--context_dim",
+        type=int,
+        default=96,
+        help="Lite 模型的上下文维度 (仅 model_type=lite 生效)",
+    )
+    parser.add_argument("--restore_ckpt", help="restore checkpoint")
+    parser.add_argument(
+        "--mixed_precision", action="store_true", help="use mixed precision"
+    )
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
-    parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
-    parser.add_argument('--train_dataset', type=str, default='sceneflow', help="training dataset choice (sceneflow or middlebury).")
-    parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=100000, help="length of training schedule.")
-    parser.add_argument('--image_size', type=int, nargs='+', default=[320, 720], help="size of the random image crops used during training.")
-    parser.add_argument('--train_iters', type=int, default=16, help="number of updates to the disparity field in each forward pass.")
-    parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
+    parser.add_argument(
+        "--batch_size", type=int, default=6, help="batch size used during training."
+    )
+    parser.add_argument(
+        "--train_datasets", nargs="+", default=["sceneflow"], help="training datasets."
+    )
+    parser.add_argument(
+        "--train_dataset",
+        type=str,
+        default="sceneflow",
+        help="training dataset choice (sceneflow or middlebury).",
+    )
+    parser.add_argument("--lr", type=float, default=0.0002, help="max learning rate.")
+    parser.add_argument(
+        "--num_steps", type=int, default=100000, help="length of training schedule."
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs="+",
+        default=[320, 720],
+        help="size of the random image crops used during training.",
+    )
+    parser.add_argument(
+        "--train_iters",
+        type=int,
+        default=16,
+        help="number of updates to the disparity field in each forward pass.",
+    )
+    parser.add_argument(
+        "--wdecay", type=float, default=0.00001, help="Weight decay in optimizer."
+    )
 
     # Validation parameters
-    parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')
+    parser.add_argument(
+        "--valid_iters",
+        type=int,
+        default=32,
+        help="number of flow-field updates during validation forward pass",
+    )
 
     # Architecure choices
-    parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
-    parser.add_argument('--shared_backbone', action='store_true', help="use a single backbone for the context and feature encoders")
-    parser.add_argument('--corr_levels', type=int, default=4, help="number of levels in the correlation pyramid")
-    parser.add_argument('--corr_radius', type=int, default=4, help="width of the correlation pyramid")
-    parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
-    parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'], help="normalization of context encoder")
-    parser.add_argument('--slow_fast_gru', action='store_true', help="iterate the low-res GRUs more frequently")
-    parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
-    parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
+    parser.add_argument(
+        "--corr_implementation",
+        choices=["reg", "alt", "reg_cuda", "alt_cuda"],
+        default="reg",
+        help="correlation volume implementation",
+    )
+    parser.add_argument(
+        "--shared_backbone",
+        action="store_true",
+        help="use a single backbone for the context and feature encoders",
+    )
+    parser.add_argument(
+        "--corr_levels",
+        type=int,
+        default=4,
+        help="number of levels in the correlation pyramid",
+    )
+    parser.add_argument(
+        "--corr_radius", type=int, default=4, help="width of the correlation pyramid"
+    )
+    parser.add_argument(
+        "--n_downsample",
+        type=int,
+        default=2,
+        help="resolution of the disparity field (1/2^K)",
+    )
+    parser.add_argument(
+        "--context_norm",
+        type=str,
+        default="batch",
+        choices=["group", "batch", "instance", "none"],
+        help="normalization of context encoder",
+    )
+    parser.add_argument(
+        "--slow_fast_gru",
+        action="store_true",
+        help="iterate the low-res GRUs more frequently",
+    )
+    parser.add_argument(
+        "--n_gru_layers", type=int, default=3, help="number of hidden GRU levels"
+    )
+    parser.add_argument(
+        "--hidden_dims",
+        nargs="+",
+        type=int,
+        default=[128] * 3,
+        help="hidden state and context dimensions",
+    )
 
     # Data augmentation
-    parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")
-    parser.add_argument('--saturation_range', type=float, nargs='+', default=None, help='color saturation')
-    parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
-    parser.add_argument('--spatial_scale', type=float, nargs='+', default=[0, 0], help='re-scale the images randomly')
-    parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
-    
+    parser.add_argument(
+        "--img_gamma", type=float, nargs="+", default=None, help="gamma range"
+    )
+    parser.add_argument(
+        "--saturation_range",
+        type=float,
+        nargs="+",
+        default=None,
+        help="color saturation",
+    )
+    parser.add_argument(
+        "--do_flip",
+        default=False,
+        choices=["h", "v"],
+        help="flip the images horizontally or vertically",
+    )
+    parser.add_argument(
+        "--spatial_scale",
+        type=float,
+        nargs="+",
+        default=[0, 0],
+        help="re-scale the images randomly",
+    )
+    parser.add_argument(
+        "--noyjitter",
+        action="store_true",
+        help="don't simulate imperfect rectification",
+    )
+
     # Refinement and ablation
-    parser.add_argument('--use_refinement', action='store_true', help="是否启用 refinement head")
-    parser.add_argument('--use_edge_loss', action='store_true', help="是否启用 edge-aware loss")
-    parser.add_argument('--refine_only', action='store_true', help="是否冻结主干，只训练 refinement head")
-    parser.add_argument('--partial_unfreeze', action='store_true', help="Train refinement_head and update_block together, while keeping the rest frozen.")
-    parser.add_argument('--lr_update_block', type=float, default=1e-5, help="Learning rate for update_block during partial unfreeze.")
-    parser.add_argument('--lr_refine', type=float, default=1e-4, help="Learning rate for refinement_head.")
-    parser.add_argument('--lambda_ref', type=float, default=1.0)
-    parser.add_argument('--lambda_edge', type=float, default=0.2)
+    parser.add_argument(
+        "--use_refinement", action="store_true", help="是否启用 refinement head"
+    )
+    parser.add_argument(
+        "--use_edge_loss", action="store_true", help="是否启用 edge-aware loss"
+    )
+    parser.add_argument(
+        "--refine_only",
+        action="store_true",
+        help="是否冻结主干，只训练 refinement head",
+    )
+    parser.add_argument(
+        "--partial_unfreeze",
+        action="store_true",
+        help="Train refinement_head and update_block together, while keeping the rest frozen.",
+    )
+    parser.add_argument(
+        "--lr_update_block",
+        type=float,
+        default=1e-5,
+        help="Learning rate for update_block during partial unfreeze.",
+    )
+    parser.add_argument(
+        "--lr_refine",
+        type=float,
+        default=1e-4,
+        help="Learning rate for refinement_head.",
+    )
+    parser.add_argument("--lambda_ref", type=float, default=1.0)
+    parser.add_argument("--lambda_edge", type=float, default=0.2)
     args = parser.parse_args()
 
     torch.manual_seed(1234)
     np.random.seed(1234)
-    
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s",
+    )
 
     Path("checkpoints").mkdir(exist_ok=True, parents=True)
 
