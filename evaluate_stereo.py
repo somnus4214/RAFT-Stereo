@@ -16,7 +16,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 @torch.no_grad()
-def validate_eth3d(model, iters=32, mixed_prec=False):
+def validate_eth3d(model, iters=32, mixed_prec=False, fp16_eval=False):
     """ Peform validation using the ETH3D (train) split """
     model.eval()
     aug_params = {}
@@ -28,11 +28,15 @@ def validate_eth3d(model, iters=32, mixed_prec=False):
         image1 = image1[None].cuda()
         image2 = image2[None].cuda()
 
+        if fp16_eval:
+            image1, image2 = image1.half(), image2.half()
+
         padder = InputPadder(image1.shape, divis_by=32)
         image1, image2 = padder.pad(image1, image2)
 
         with autocast(enabled=mixed_prec):
             _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
+
         flow_pr = padder.unpad(flow_pr.float()).cpu().squeeze(0)
         assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
         epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
@@ -57,7 +61,7 @@ def validate_eth3d(model, iters=32, mixed_prec=False):
 
 
 @torch.no_grad()
-def validate_kitti(model, iters=32, mixed_prec=False):
+def validate_kitti(model, iters=32, mixed_prec=False, fp16_eval=False):
     """ Peform validation using the KITTI-2015 (train) split """
     model.eval()
     aug_params = {}
@@ -70,6 +74,9 @@ def validate_kitti(model, iters=32, mixed_prec=False):
         image1 = image1[None].cuda()
         image2 = image2[None].cuda()
 
+        if fp16_eval:
+            image1, image2 = image1.half(), image2.half()
+
         padder = InputPadder(image1.shape, divis_by=32)
         image1, image2 = padder.pad(image1, image2)
 
@@ -80,8 +87,7 @@ def validate_kitti(model, iters=32, mixed_prec=False):
 
         if val_id > 50:
             elapsed_list.append(end-start)
-        flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
-
+        flow_pr = padder.unpad(flow_pr.float()).cpu().squeeze(0)
         assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
         epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
 
@@ -109,7 +115,7 @@ def validate_kitti(model, iters=32, mixed_prec=False):
 
 
 @torch.no_grad()
-def validate_things(model, iters=32, mixed_prec=False):
+def validate_things(model, iters=32, mixed_prec=False, fp16_eval=False):
     """ Peform validation using the FlyingThings3D (TEST) split """
     model.eval()
     val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True)
@@ -120,12 +126,16 @@ def validate_things(model, iters=32, mixed_prec=False):
         image1 = image1[None].cuda()
         image2 = image2[None].cuda()
 
+        if fp16_eval:
+            image1, image2 = image1.half(), image2.half()
+
         padder = InputPadder(image1.shape, divis_by=32)
         image1, image2 = padder.pad(image1, image2)
 
         with autocast(enabled=mixed_prec):
             _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-        flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
+
+        flow_pr = padder.unpad(flow_pr.float()).cpu().squeeze(0)
         assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
         epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
 
@@ -147,7 +157,7 @@ def validate_things(model, iters=32, mixed_prec=False):
 
 
 @torch.no_grad()
-def validate_middlebury(model, iters=32, split='F', mixed_prec=False):
+def validate_middlebury(model, iters=32, split='F', mixed_prec=False, fp16_eval=False):
     """ Peform validation using the Middlebury-V3 dataset """
     model.eval()
     aug_params = {}
@@ -159,12 +169,16 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False):
         image1 = image1[None].cuda()
         image2 = image2[None].cuda()
 
+        if fp16_eval:
+            image1, image2 = image1.half(), image2.half()
+
         padder = InputPadder(image1.shape, divis_by=32)
         image1, image2 = padder.pad(image1, image2)
 
         with autocast(enabled=mixed_prec):
             _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-        flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
+
+        flow_pr = padder.unpad(flow_pr.float()).cpu().squeeze(0)
 
         assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
         epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
@@ -193,6 +207,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default=None)
     parser.add_argument('--dataset', help="dataset for evaluation", required=True, choices=["eth3d", "kitti", "things"] + [f"middlebury_{s}" for s in ['F','H','Q','2014']])
+    parser.add_argument('--fp16_eval', action='store_true', help='evaluate using half precision (FP16)')
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
 
@@ -223,22 +238,24 @@ if __name__ == '__main__':
 
     model.cuda()
     model.eval()
+    if args.fp16_eval:
+        model.half()
 
     print(f"The model has {format(count_parameters(model)/1e6, '.2f')}M learnable parameters.")
 
     # The CUDA implementations of the correlation volume prevent half-precision
     # rounding errors in the correlation lookup. This allows us to use mixed precision
-    # in the entire forward pass, not just in the GRUs & feature extractors. 
+    # in the entire forward pass, not just in the GRUs & feature extractors.
     use_mixed_precision = args.corr_implementation.endswith("_cuda")
 
     if args.dataset == 'eth3d':
-        validate_eth3d(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
+        validate_eth3d(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, fp16_eval=args.fp16_eval)
 
     elif args.dataset == 'kitti':
-        validate_kitti(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
+        validate_kitti(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, fp16_eval=args.fp16_eval)
 
     elif args.dataset in [f"middlebury_{s}" for s in ['F','H','Q','2014']]:
-        validate_middlebury(model, iters=args.valid_iters, split=args.dataset.split('_')[-1], mixed_prec=use_mixed_precision)
+        validate_middlebury(model, iters=args.valid_iters, split=args.dataset.split('_')[-1], mixed_prec=use_mixed_precision, fp16_eval=args.fp16_eval)
 
     elif args.dataset == 'things':
-        validate_things(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
+        validate_things(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, fp16_eval=args.fp16_eval)

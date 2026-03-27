@@ -114,6 +114,12 @@ class RAFTStereo(nn.Module):
             coords1 = coords1.detach()
             corr = corr_fn(coords1) # index correlation volume
             flow = coords1 - coords0
+            
+            # Match dtype for fp16 inference without autocast
+            if net_list[0].dtype == torch.float16:
+                corr = corr.half()
+                flow = flow.half()
+                
             with autocast(enabled=self.args.mixed_precision):
                 if self.args.n_gru_layers == 3 and self.args.slow_fast_gru: # Update low-res GRU
                     net_list = self.update_block(net_list, inp_list, iter32=True, iter16=False, iter08=False, update=False)

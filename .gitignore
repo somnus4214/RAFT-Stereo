@@ -4,5 +4,4 @@ runs
 checkpoints
 __pycache__
 demo_output
-logs
 .vscode

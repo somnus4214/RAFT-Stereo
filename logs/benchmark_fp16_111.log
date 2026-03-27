@@ -1,0 +1,8 @@
+/root/miniconda3/envs/raftstereo/lib/python3.7/site-packages/torch/functional.py:568: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at  /opt/conda/conda-bld/pytorch_1646755953518/work/aten/src/ATen/native/TensorShape.cpp:2228.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Warming up for 10 iterations (FP16/Mixed Precision: True)...
+Running inference for 50 iterations...
+=== Inference Benchmark Results ===
+Average Inference Time : 173.59 ms
+Frames Per Second (FPS): 5.76
+Max CUDA Memory Alloc  : 662.34 MB
